@@ -1,0 +1,466 @@
+{
+  "name": "Healthcare Appointment Scheduler",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "appointment-booking",
+        "responseMode": "responseNode",
+        "responseCode": 200,
+        "responseHeaders": {
+          "Content-Type": "application/json"
+        }
+      },
+      "name": "Webhook - Appointment Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "healthcare-booking"
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "messages": {
+          "messageType": "text",
+          "message": "You are an AI assistant for a healthcare clinic. The input will be a patient's appointment request with details like date, time, and doctor preference. Extract and return data in JSON with patientName, email, phone, requestedDate, requestedTime, doctorPreference, reasonForVisit, suggestedSpecialty (based on reason), and priority (low/medium/high based on urgency). Input: {{ JSON.stringify($json) }}"
+        },
+        "options": {
+          "responseFormat": "json_object"
+        }
+      },
+      "name": "OpenAI - Process Request",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [460, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "1",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "scan",
+        "tableName": "doctors",
+        "filterExpression": "specialty = :specialty",
+        "expressionAttributeValues": {
+          ":specialty": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).suggestedSpecialty }}"
+        }
+      },
+      "name": "DynamoDB - Find Doctor",
+      "type": "n8n-nodes-base.awsDynamoDb",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "credentials": {
+        "aws": {
+          "id": "1",
+          "name": "AWS Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "scan",
+        "tableName": "appointments",
+        "filterExpression": "doctorId = :doctorId AND requestedDate = :date AND requestedTime = :time",
+        "expressionAttributeValues": {
+          ":doctorId": "={{ $node['DynamoDB - Find Doctor'].json.Items[0].id }}",
+          ":date": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).requestedDate }}",
+          ":time": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).requestedTime }}"
+        }
+      },
+      "name": "DynamoDB - Check Availability",
+      "type": "n8n-nodes-base.awsDynamoDb",
+      "typeVersion": 1,
+      "position": [900, 300],
+      "credentials": {
+        "aws": {
+          "id": "1",
+          "name": "AWS Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false
+          },
+          "conditions": [
+            {
+              "id": "available",
+              "leftValue": "={{ $node['DynamoDB - Check Availability'].json.Items.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "combineOperation": "all"
+      },
+      "name": "IF - Slot Available",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "tableName": "appointments",
+        "item": {
+          "appointmentId": "APT-{{ new Date().getFullYear() }}-{{ Math.floor(Math.random() * 1000000).toString().padStart(6, '0') }}",
+          "patientName": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).patientName }}",
+          "email": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).email }}",
+          "phone": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).phone }}",
+          "requestedDate": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).requestedDate }}",
+          "requestedTime": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).requestedTime }}",
+          "doctorId": "={{ $node['DynamoDB - Find Doctor'].json.Items[0].id }}",
+          "doctorName": "={{ $node['DynamoDB - Find Doctor'].json.Items[0].name }}",
+          "reasonForVisit": "={{ JSON.parse($node['OpenAI - Process Request'].json.choices[0].message.content).reasonForVisit }}",
+          "status": "confirmed",
+          "createdAt": "{{ new Date().toISOString() }}"
+        }
+      },
+      "name": "DynamoDB - Save Appointment",
+      "type": "n8n-nodes-base.awsDynamoDb",
+      "typeVersion": 1,
+      "position": [1340, 200],
+      "credentials": {
+        "aws": {
+          "id": "1",
+          "name": "AWS Credentials"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "subject": "Appointment Confirmation - {{ $node['DynamoDB - Save Appointment'].json.appointmentId }}",
+        "emailType": "html",
+        "message": "<h2>Your Appointment is Confirmed!</h2><p>Dear {{ $node['DynamoDB - Save Appointment'].json.patientName }},</p><p>Your appointment has been successfully scheduled:</p><ul><li><strong>Date:</strong> {{ $node['DynamoDB - Save Appointment'].json.requestedDate }}</li><li><strong>Time:</strong> {{ $node['DynamoDB - Save Appointment'].json.requestedTime }}</li><li><strong>Doctor:</strong> {{ $node['DynamoDB - Save Appointment'].json.doctorName }}</li><li><strong>Appointment ID:</strong> {{ $node['DynamoDB - Save Appointment'].json.appointmentId }}</li></ul><p>Please arrive 15 minutes early and bring your ID and insurance card.</p><p>Best regards,<br>MediCare Clinic</p>",
+        "toEmail": "={{ $node['DynamoDB - Save Appointment'].json.email }}",
+        "fromEmail": "appointments@medicare.com",
+        "fromName": "MediCare Clinic"
+      },
+      "name": "Email - Confirmation",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1560, 120],
+      "credentials": {
+        "smtp": {
+          "id": "1",
+          "name": "SMTP Email"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "message": "Your appointment with {{ $node['DynamoDB - Save Appointment'].json.doctorName }} is confirmed for {{ $node['DynamoDB - Save Appointment'].json.requestedDate }} at {{ $node['DynamoDB - Save Appointment'].json.requestedTime }}. Appointment ID: {{ $node['DynamoDB - Save Appointment'].json.appointmentId }}",
+        "toNumber": "={{ $node['DynamoDB - Save Appointment'].json.phone }}",
+        "fromNumber": "+15551234567"
+      },
+      "name": "SMS - Confirmation",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [1560, 200],
+      "credentials": {
+        "twilioApi": {
+          "id": "1",
+          "name": "Twilio API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 86400,
+        "unit": "seconds"
+      },
+      "name": "Wait - 24 Hours",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1780, 120]
+    },
+    {
+      "parameters": {
+        "message": "Reminder: You have an appointment tomorrow with {{ $node['DynamoDB - Save Appointment'].json.doctorName }} at {{ $node['DynamoDB - Save Appointment'].json.requestedTime }}. Please arrive 15 minutes early.",
+        "toNumber": "={{ $node['DynamoDB - Save Appointment'].json.phone }}",
+        "fromNumber": "+15551234567"
+      },
+      "name": "SMS - 24hr Reminder",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [2000, 120],
+      "credentials": {
+        "twilioApi": {
+          "id": "1",
+          "name": "Twilio API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 82800,
+        "unit": "seconds"
+      },
+      "name": "Wait - 1 Hour Before",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [2220, 120]
+    },
+    {
+      "parameters": {
+        "message": "Final reminder: Your appointment with {{ $node['DynamoDB - Save Appointment'].json.doctorName }} is in 1 hour at {{ $node['DynamoDB - Save Appointment'].json.requestedTime }}. See you soon!",
+        "toNumber": "={{ $node['DynamoDB - Save Appointment'].json.phone }}",
+        "fromNumber": "+15551234567"
+      },
+      "name": "SMS - 1hr Reminder",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [2440, 120],
+      "credentials": {
+        "twilioApi": {
+          "id": "1",
+          "name": "Twilio API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://api.retellai.com/call",
+        "options": {
+          "headers": {
+            "Authorization": "Bearer {{ $credentials.retellAi.apiKey }}",
+            "Content-Type": "application/json"
+          }
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "phone_number",
+              "value": "={{ $node['DynamoDB - Save Appointment'].json.phone }}"
+            },
+            {
+              "name": "agent_id",
+              "value": "appointment-confirmation-agent"
+            },
+            {
+              "name": "metadata",
+              "value": {
+                "appointmentId": "={{ $node['DynamoDB - Save Appointment'].json.appointmentId }}",
+                "patientName": "={{ $node['DynamoDB - Save Appointment'].json.patientName }}",
+                "appointmentDate": "={{ $node['DynamoDB - Save Appointment'].json.requestedDate }}",
+                "appointmentTime": "={{ $node['DynamoDB - Save Appointment'].json.requestedTime }}",
+                "doctorName": "={{ $node['DynamoDB - Save Appointment'].json.doctorName }}"
+              }
+            }
+          ]
+        }
+      },
+      "name": "Voice Call - Optional",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 280],
+      "credentials": {
+        "retellAi": {
+          "id": "1",
+          "name": "Retell AI API"
+        }
+      },
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": {
+          "success": true,
+          "message": "Appointment scheduled successfully",
+          "appointmentId": "={{ $node['DynamoDB - Save Appointment'].json.appointmentId }}",
+          "patientName": "={{ $node['DynamoDB - Save Appointment'].json.patientName }}",
+          "email": "={{ $node['DynamoDB - Save Appointment'].json.email }}",
+          "phone": "={{ $node['DynamoDB - Save Appointment'].json.phone }}",
+          "confirmedDate": "={{ $node['DynamoDB - Save Appointment'].json.requestedDate }}",
+          "confirmedTime": "={{ $node['DynamoDB - Save Appointment'].json.requestedTime }}",
+          "doctor": {
+            "name": "={{ $node['DynamoDB - Save Appointment'].json.doctorName }}",
+            "specialty": "={{ $node['DynamoDB - Find Doctor'].json.Items[0].specialty }}"
+          },
+          "reasonForVisit": "={{ $node['DynamoDB - Save Appointment'].json.reasonForVisit }}",
+          "status": "confirmed"
+        }
+      },
+      "name": "Response - Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1780, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 409,
+        "responseBody": {
+          "success": false,
+          "message": "The requested time slot is not available. Please choose a different time.",
+          "error": "TIME_SLOT_UNAVAILABLE"
+        }
+      },
+      "name": "Response - Unavailable",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1340, 400]
+    }
+  ],
+  "connections": {
+    "Webhook - Appointment Request": {
+      "main": [
+        [
+          {
+            "node": "OpenAI - Process Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI - Process Request": {
+      "main": [
+        [
+          {
+            "node": "DynamoDB - Find Doctor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DynamoDB - Find Doctor": {
+      "main": [
+        [
+          {
+            "node": "DynamoDB - Check Availability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DynamoDB - Check Availability": {
+      "main": [
+        [
+          {
+            "node": "IF - Slot Available",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Slot Available": {
+      "main": [
+        [
+          {
+            "node": "DynamoDB - Save Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Response - Unavailable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DynamoDB - Save Appointment": {
+      "main": [
+        [
+          {
+            "node": "Email - Confirmation",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "SMS - Confirmation",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Voice Call - Optional",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Response - Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email - Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Wait - 24 Hours",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait - 24 Hours": {
+      "main": [
+        [
+          {
+            "node": "SMS - 24hr Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SMS - 24hr Reminder": {
+      "main": [
+        [
+          {
+            "node": "Wait - 1 Hour Before",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait - 1 Hour Before": {
+      "main": [
+        [
+          {
+            "node": "SMS - 1hr Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "createdAt": "2024-08-09T12:00:00.000Z",
+  "updatedAt": "2024-08-09T12:00:00.000Z",
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": [
+    {
+      "createdAt": "2024-08-09T12:00:00.000Z",
+      "updatedAt": "2024-08-09T12:00:00.000Z",
+      "id": "healthcare",
+      "name": "Healthcare"
+    }
+  ]
+}
